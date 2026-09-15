@@ -1,8 +1,13 @@
+#[cfg(target_os = "macos")]
+mod macos;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{const_mutex, Mutex};
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
+#[cfg(not(target_os = "macos"))]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tiny_skia::{
@@ -41,7 +46,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip("Hotaru · 正在连接后端…")
         .show_menu_on_left_click(false)
-        .on_menu_event(on_menu_event)
+        .on_menu_event(on_menu_event);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder
+        .menu(&menu)
         .on_tray_icon_event(|tray, event| match event {
             // Left click opens the chart popover anchored to the icon; right
             // click keeps the native menu, double click opens the panel.
@@ -53,22 +61,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 rect,
                 ..
             } => {
-                let (px, py) = match rect.position {
-                    tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
-                    tauri::Position::Logical(p) => (p.x, p.y),
-                };
-                let (sw, sh) = match rect.size {
-                    tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                    tauri::Size::Logical(s) => (s.width, s.height),
-                };
-                crate::windows::open_chart(tray.app_handle(), (px, py, sw, sh));
+                toggle_chart(tray.app_handle(), rect);
             }
-            #[cfg(target_os = "macos")]
-            TrayIconEvent::Click {
-                button: MouseButton::Right,
-                button_state: MouseButtonState::Up,
-                ..
-            } => show_context_menu(tray.app_handle()),
             TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
@@ -79,10 +73,22 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         });
     // AppKit can consume left clicks when a menu is attached to NSStatusItem.
     // On macOS, present the menu explicitly only for a right click.
-    #[cfg(not(target_os = "macos"))]
-    let builder = builder.menu(&menu);
     builder.build(app)?;
+    #[cfg(target_os = "macos")]
+    macos::install(app)?;
     Ok(())
+}
+
+fn toggle_chart(app: &AppHandle, rect: tauri::Rect) {
+    let (px, py) = match rect.position {
+        tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+        tauri::Position::Logical(p) => (p.x, p.y),
+    };
+    let (sw, sh) = match rect.size {
+        tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+        tauri::Size::Logical(s) => (s.width, s.height),
+    };
+    crate::windows::open_chart(app, (px, py, sw, sh));
 }
 
 #[cfg(target_os = "macos")]
@@ -99,9 +105,9 @@ fn show_context_menu(app: &AppHandle) {
                 "tray-menu-host",
                 tauri::WebviewUrl::External("about:blank".parse().expect("valid blank URL")),
             )
-                .visible(false)
-                .build()
-                .ok()
+            .visible(false)
+            .build()
+            .ok()
         });
         if let Some(window) = window {
             // With no position, AppKit uses the mouse's screen coordinates,
