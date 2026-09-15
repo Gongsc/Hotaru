@@ -6,13 +6,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke,
-    Transform,
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
 };
 
 use crate::models::{
-    aggregate, fmt_rate, icon_state, scoped_nodes, Aggregate, IconState,
-    MonitorSnapshot, Severity,
+    aggregate, fmt_rate, icon_state, scoped_nodes, Aggregate, IconState, MonitorSnapshot, Severity,
 };
 use crate::state::AppState;
 
@@ -24,12 +22,17 @@ pub const TRAY_ID: &str = "hotaru-main-tray";
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let cache = MenuCache::build(app)?;
+    #[cfg(not(target_os = "macos"))]
     let menu = cache.menu.clone();
     *MENU_CACHE.lock() = Some(cache);
-    TrayIconBuilder::with_id(TRAY_ID)
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(tauri::image::Image::new_owned(
             draw_icon(
-                &IconState { severity: Severity::Down, gauge: None, badge: false },
+                &IconState {
+                    severity: Severity::Down,
+                    gauge: None,
+                    badge: false,
+                },
                 icon_foreground(app),
             ),
             ICON_SIZE,
@@ -37,7 +40,6 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         ))
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip("Hotaru · 正在连接后端…")
-        .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(on_menu_event)
         .on_tray_icon_event(|tray, event| match event {
@@ -61,13 +63,52 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 };
                 crate::windows::open_chart(tray.app_handle(), (px, py, sw, sh));
             }
-            TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+            #[cfg(target_os = "macos")]
+            TrayIconEvent::Click {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                ..
+            } => show_context_menu(tray.app_handle()),
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
                 crate::windows::open_panel(tray.app_handle());
             }
             _ => {}
-        })
-        .build(app)?;
+        });
+    // AppKit can consume left clicks when a menu is attached to NSStatusItem.
+    // On macOS, present the menu explicitly only for a right click.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.menu(&menu);
+    builder.build(app)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn show_context_menu(app: &AppHandle) {
+    // Release the cache lock before entering AppKit's nested menu event loop:
+    // menu actions and monitoring updates may need to acquire it again.
+    let menu = MENU_CACHE.lock().as_ref().map(|cache| cache.menu.clone());
+    if let Some(menu) = menu {
+        // A user may have closed settings before configuring a backend.
+        // Keep a hidden window available as the context menu host.
+        let window = app.webview_windows().into_values().next().or_else(|| {
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "tray-menu-host",
+                tauri::WebviewUrl::External("about:blank".parse().expect("valid blank URL")),
+            )
+                .visible(false)
+                .build()
+                .ok()
+        });
+        if let Some(window) = window {
+            // With no position, AppKit uses the mouse's screen coordinates,
+            // including when the backing window is hidden.
+            let _ = window.popup_menu(&menu);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

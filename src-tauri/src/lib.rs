@@ -85,11 +85,8 @@ pub fn run() {
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(250));
                         if win.is_visible().unwrap_or(false) && !win.is_focused().unwrap_or(true) {
-                            *win
-                                .app_handle()
-                                .state::<AppState>()
-                                .chart_hidden_at
-                                .lock() = Some(std::time::Instant::now());
+                            *win.app_handle().state::<AppState>().chart_hidden_at.lock() =
+                                Some(std::time::Instant::now());
                             crate::windows::close_chart(win.app_handle());
                         }
                     });
@@ -118,6 +115,16 @@ pub fn run() {
             commands::resize_chart,
             commands::get_ping_records,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running hotaru");
+        .build(tauri::generate_context!())
+        .expect("error while building hotaru")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                // A tray app must survive closing its last window, including
+                // the gap while refresh destroys and rebuilds the panel.
+                // Explicit exit/restart requests carry a code and still work.
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
