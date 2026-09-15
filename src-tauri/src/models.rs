@@ -28,6 +28,7 @@ pub struct Settings {
     /// Start into the tray only: the panel webview is still created at launch
     /// but stays hidden until asked for.
     pub silent_start: bool,
+    pub chart_keep_open: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +48,7 @@ impl Default for Settings {
             hidden_nodes: Vec::new(),
             node_badge: NodeBadge::Tags,
             silent_start: false,
+            chart_keep_open: false,
         }
     }
 }
@@ -347,16 +349,28 @@ pub struct IconState {
 
 pub fn icon_state(settings: &Settings, snap: &MonitorSnapshot) -> IconState {
     if !snap.backend_ok {
-        return IconState { severity: Severity::Down, gauge: None, badge: false };
+        return IconState {
+            severity: Severity::Down,
+            gauge: None,
+            badge: false,
+        };
     }
     let scope = scoped_nodes(settings, &snap.nodes);
     if scope.is_empty() {
-        return IconState { severity: Severity::Down, gauge: None, badge: false };
+        return IconState {
+            severity: Severity::Down,
+            gauge: None,
+            badge: false,
+        };
     }
     let offline = scope.iter().filter(|n| !n.online).count();
     let online: Vec<&&NodeSnapshot> = scope.iter().filter(|n| n.online).collect();
     if online.is_empty() {
-        return IconState { severity: Severity::Err, gauge: None, badge: false };
+        return IconState {
+            severity: Severity::Err,
+            gauge: None,
+            badge: false,
+        };
     }
     let mut gauge: Option<f64> = None;
     let mut severity = Severity::Ok;
@@ -364,7 +378,10 @@ pub fn icon_state(settings: &Settings, snap: &MonitorSnapshot) -> IconState {
     for n in &online {
         for (value, warn) in [
             (n.cpu_usage, settings.cpu_warn_pct),
-            (pct(n.ram_used, n.ram_total).unwrap_or(0.0), settings.mem_warn_pct),
+            (
+                pct(n.ram_used, n.ram_total).unwrap_or(0.0),
+                settings.mem_warn_pct,
+            ),
         ] {
             let s = if value >= err_threshold(warn) {
                 Severity::Err
@@ -385,7 +402,11 @@ pub fn icon_state(settings: &Settings, snap: &MonitorSnapshot) -> IconState {
         TrayMode::Aggregate => offline > 0,
         TrayMode::Node => false,
     };
-    IconState { severity, gauge, badge }
+    IconState {
+        severity,
+        gauge,
+        badge,
+    }
 }
 
 fn rank(s: Severity) -> u8 {
@@ -663,7 +684,10 @@ mod tests {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.node_badge, NodeBadge::Tags);
 
-        let net = Settings { node_badge: NodeBadge::Net, ..Settings::default() };
+        let net = Settings {
+            node_badge: NodeBadge::Net,
+            ..Settings::default()
+        };
         let json = serde_json::to_value(&net).unwrap();
         assert_eq!(json["node_badge"], "net");
         let back: Settings = serde_json::from_value(json).unwrap();
@@ -674,7 +698,10 @@ mod tests {
     fn normalize_base_variants() {
         assert_eq!(normalize_base(" https://a.com/ ").unwrap(), "https://a.com");
         assert_eq!(normalize_base("a.com").unwrap(), "https://a.com");
-        assert_eq!(normalize_base("http://a.com:8080//").unwrap(), "http://a.com:8080");
+        assert_eq!(
+            normalize_base("http://a.com:8080//").unwrap(),
+            "http://a.com:8080"
+        );
         assert!(normalize_base("").is_err());
         assert!(normalize_base("ftp://a.com").is_err());
     }
@@ -689,7 +716,10 @@ mod tests {
 
     #[test]
     fn ws_url_variants() {
-        assert_eq!(ws_url_of("https://a.com").unwrap(), "wss://a.com/api/clients");
+        assert_eq!(
+            ws_url_of("https://a.com").unwrap(),
+            "wss://a.com/api/clients"
+        );
         assert_eq!(ws_url_of("http://a.com").unwrap(), "ws://a.com/api/clients");
     }
 
@@ -753,7 +783,10 @@ mod tests {
         assert_eq!(snap.expired_at.as_deref(), Some("2027-01-01T00:00:00Z"));
         // unknown node gets a fallback name
         let rep2 = payload.data.get("uuid-2").unwrap();
-        let info2 = ClientInfo { uuid: "uuid-2".into(), ..Default::default() };
+        let info2 = ClientInfo {
+            uuid: "uuid-2".into(),
+            ..Default::default()
+        };
         let snap2 = report_to_snapshot(&info2, false, rep2);
         assert_eq!(snap2.name, "节点 uuid-2");
         assert_eq!(snap2.uptime_secs, 0);
@@ -761,13 +794,16 @@ mod tests {
 
     #[test]
     fn client_info_parses_billing_metadata() {
-        let info: ClientInfo = serde_json::from_str(r#"{
+        let info: ClientInfo = serde_json::from_str(
+            r#"{
           "uuid":"node-1",
           "name":"Tokyo",
           "traffic_limit":1099511627776,
           "traffic_limit_type":"sum",
           "expired_at":"2027-06-30T00:00:00Z"
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(info.traffic_limit, 1_099_511_627_776);
         assert_eq!(info.traffic_limit_type, "sum");
         assert_eq!(info.expired_at.as_deref(), Some("2027-06-30T00:00:00Z"));
@@ -860,7 +896,10 @@ mod tests {
         // cpu above warn -> Warn
         let mut high = snap.nodes[0].clone();
         high.cpu_usage = 88.0;
-        let snap3 = MonitorSnapshot { nodes: vec![high], ..snap };
+        let snap3 = MonitorSnapshot {
+            nodes: vec![high],
+            ..snap
+        };
         assert_eq!(icon_state(&s, &snap3).severity, Severity::Warn);
 
         // node mode without badge
@@ -928,7 +967,10 @@ mod tests {
         let lost = [p(1, -1.0, 7), p(2, -1.0, 9)];
         assert_eq!(
             summarize_ping(&lost),
-            PingSummary { latency: None, loss: Some(1.0) }
+            PingSummary {
+                latency: None,
+                loss: Some(1.0)
+            }
         );
 
         // No records at all -> nothing known, so the node sorts last either way.

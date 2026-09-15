@@ -226,6 +226,9 @@
 
   <section data-tab="general">
     <h2>图表</h2>
+    <label class="check">
+      <input type="checkbox" id="chartKeepOpen"> 左键面板失焦后保持打开
+    </label>
     <label class="field">
       <span>曲线显示区间（托盘左键弹窗）</span>
       <select id="chartRange">
@@ -356,6 +359,7 @@ function collect() {
     hidden_nodes: [...hiddenNodes],
     node_badge: nodeBadgeValue(),
     silent_start: $('silentStart').checked,
+    chart_keep_open: $('chartKeepOpen').checked,
   };
 }
 
@@ -369,6 +373,7 @@ function fillSettings(s, keepNodeList) {
   $('showTitle').checked = !!s.show_menu_bar_text;
   $('acceptInvalid').checked = !!s.accept_invalid_certs;
   $('silentStart').checked = !!s.silent_start;
+  $('chartKeepOpen').checked = !!s.chart_keep_open;
   setNodeBadge(s.node_badge);
   $('chartRange').value = String(s.chart_range_secs ?? 900);
   if ($('chartRange').selectedIndex === -1) $('chartRange').value = '900';

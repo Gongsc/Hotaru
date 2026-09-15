@@ -4,6 +4,7 @@ mod monitor;
 mod settings;
 mod state;
 mod tray;
+mod window_geometry;
 mod windows;
 
 use tauri::{Manager, WindowEvent};
@@ -22,6 +23,7 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(state::init(&handle));
+            app.manage(window_geometry::init(&handle));
             let theme = handle.state::<AppState>().settings.read().theme;
             windows::sync_theme(&handle, theme);
             tray::create(&handle)?;
@@ -46,10 +48,14 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| match event {
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                window_geometry::remember(window);
+            }
             WindowEvent::ThemeChanged(_) => {
                 tray::refresh(window.app_handle());
             }
             WindowEvent::CloseRequested { api, .. } => {
+                window_geometry::remember(window);
                 if window.label() == "main" {
                     // Closing the panel hides it; the tray keeps running.
                     // Bump the panel epoch so pending open-watchdogs don't
@@ -78,13 +84,20 @@ pub fn run() {
                         .state::<AppState>()
                         .chart_pinned
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if pinned {
+                    if pinned || handle.state::<AppState>().settings.read().chart_keep_open {
                         return;
                     }
                     let win = window.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(250));
-                        if win.is_visible().unwrap_or(false) && !win.is_focused().unwrap_or(true) {
+                        let state = win.app_handle().state::<AppState>();
+                        if !state.settings.read().chart_keep_open
+                            && !state
+                                .chart_pinned
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            && win.is_visible().unwrap_or(false)
+                            && !win.is_focused().unwrap_or(true)
+                        {
                             *win.app_handle().state::<AppState>().chart_hidden_at.lock() =
                                 Some(std::time::Instant::now());
                             crate::windows::close_chart(win.app_handle());

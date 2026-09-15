@@ -1,8 +1,8 @@
 #[cfg(target_os = "macos")]
 use tauri::window::{Effect, EffectState, EffectsBuilder};
 use tauri::{
-    webview::PageLoadEvent, AppHandle, Manager, PhysicalPosition, WebviewUrl,
-    WebviewWindow, WebviewWindowBuilder,
+    webview::PageLoadEvent, AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 
 use crate::models::{normalize_base, ThemeMode};
@@ -501,7 +501,9 @@ pub fn sync_panel_url(app: &AppHandle, backend_url: &str) {
 /// `show` — see `create_panel` for why lazy creation is avoided.
 pub fn preload_panel_hidden(app: &AppHandle) {
     let raw = app.state::<AppState>().settings.read().backend_url.clone();
-    let Ok(base) = normalize_base(&raw) else { return };
+    let Ok(base) = normalize_base(&raw) else {
+        return;
+    };
     let _ = create_panel(app, &base, false);
 }
 
@@ -515,7 +517,7 @@ fn create_panel(app: &AppHandle, base: &str, visible: bool) -> tauri::Result<()>
         .title("Hotaru Panel")
         .theme(native_theme(theme))
         .decorations(false)
-        .visible(visible)
+        .visible(false)
         .initialization_script(panel_chrome_script())
         .on_page_load(|window, payload| match payload.event() {
             PageLoadEvent::Started => {
@@ -530,8 +532,10 @@ fn create_panel(app: &AppHandle, base: &str, visible: bool) -> tauri::Result<()>
         .inner_size(1200.0, 800.0)
         .min_inner_size(780.0, 560.0)
         .build()?;
+    crate::window_geometry::restore(&window);
     *app.state::<AppState>().loaded_panel_url.lock() = Some(base.to_string());
     if visible {
+        let _ = window.show();
         let _ = window.set_focus();
     }
     spawn_panel_watchdog(app, visible);
@@ -548,7 +552,6 @@ pub fn open_chart(app: &AppHandle, icon_rect: (f64, f64, f64, f64)) {
     let center_x = ix + iw / 2.0;
 
     let st = app.state::<AppState>();
-    let pinned = st.chart_pinned.load(std::sync::atomic::Ordering::Relaxed);
 
     // The popover hides itself on blur; when the tray click caused that blur
     // (last hide < CHART_REOPEN_GUARD ago) this very click is the toggle-close.
@@ -577,24 +580,10 @@ pub fn open_chart(app: &AppHandle, icon_rect: (f64, f64, f64, f64)) {
             if window.is_visible().unwrap_or(false) {
                 // Toggle-close without destroying the webview; reopening can
                 // reuse the current node data and UI state.
+                crate::window_geometry::remember(&window.as_ref().window());
                 let _ = window.hide();
                 crate::tray::set_popover_active(app, false);
                 return;
-            }
-            if !pinned {
-                // The retained page may be taller because a node is expanded.
-                // Anchor using its real size instead of the initial estimate.
-                let current_h = window
-                    .inner_size()
-                    .ok()
-                    .and_then(|size| {
-                        window
-                            .scale_factor()
-                            .ok()
-                            .map(|scale| size.height as f64 / scale)
-                    })
-                    .unwrap_or(ch);
-                position_chart(app, &window, center_x, iy, iy + ih, current_h);
             }
             window
         }
@@ -629,9 +618,10 @@ pub fn open_chart(app: &AppHandle, icon_rect: (f64, f64, f64, f64)) {
                 "const setWindowsOpaque=()=>document.documentElement?.classList.add('windows-opaque');if(document.documentElement){setWindowsOpaque()}else{document.addEventListener('DOMContentLoaded',setWindowsOpaque,{once:true})}",
             );
             let Ok(window) = builder
-                .always_on_top(true)
+                .always_on_top(st.chart_pinned.load(std::sync::atomic::Ordering::Relaxed))
                 .skip_taskbar(true)
-                .resizable(false)
+                .resizable(true)
+                .min_inner_size(CHART_W, CHART_MIN_H)
                 .shadow(false)
                 .visible(false)
                 .build()
@@ -640,6 +630,11 @@ pub fn open_chart(app: &AppHandle, icon_rect: (f64, f64, f64, f64)) {
             };
             round_window_corners(&window);
             position_chart(app, &window, center_x, iy, iy + ih, ch);
+            crate::window_geometry::restore(&window);
+            if let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
+                let _ =
+                    window.set_size_constraints(chart_size_constraints(size.height as f64 / scale));
+            }
             window
         }
     };
@@ -690,6 +685,7 @@ fn round_window_corners(_window: &WebviewWindow) {}
 /// selected at the same moment the popover leaves the screen.
 pub fn close_chart(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("chart") {
+        crate::window_geometry::remember(&window.as_ref().window());
         let _ = window.hide();
     }
     crate::tray::set_popover_active(app, false);
@@ -779,6 +775,16 @@ fn anchored_y(
     }
 }
 
+/// Lock only the vertical axis. Update this lock whenever content height changes.
+fn chart_size_constraints(height: f64) -> tauri::WindowSizeConstraints {
+    tauri::WindowSizeConstraints {
+        min_width: Some(tauri::LogicalUnit(CHART_W).into()),
+        max_width: None,
+        min_height: Some(tauri::LogicalUnit(height).into()),
+        max_height: Some(tauri::LogicalUnit(height).into()),
+    }
+}
+
 /// Resize the popover to `logical_h`, growing away from the edge anchored to
 /// the tray icon: hanging under the menu bar it keeps its top edge and extends
 /// downwards, sitting above the taskbar it keeps its bottom edge and extends
@@ -824,18 +830,16 @@ pub fn resize_chart(app: &AppHandle, logical_h: f64) -> f64 {
     let y = anchored_y(below, pos.y as f64, cur_h, target_h, work);
 
     let new_pos = PhysicalPosition::new(pos.x, y as i32);
-    // Set the width logically every time rather than carrying the current
-    // physical one forward. The popover can end up on a monitor with a
-    // different scale factor than the one it was built on, and a physical width
-    // frozen at the old scale no longer equals CHART_W logical pixels — the page
-    // still lays out at 320 CSS px, so the window clips it on both sides.
-    let new_size = tauri::LogicalSize::new(CHART_W, applied);
+    // Content owns height; keep the width chosen by the user, also across DPI changes.
+    let new_size = tauri::LogicalSize::new(size.width as f64 / scale, applied);
     // Move before growing, shrink before moving: either order leaves the
     // window briefly overhanging the anchored screen edge otherwise.
     if target_h > cur_h {
         let _ = window.set_position(new_pos);
+        let _ = window.set_size_constraints(chart_size_constraints(applied));
         let _ = window.set_size(new_size);
     } else {
+        let _ = window.set_size_constraints(chart_size_constraints(applied));
         let _ = window.set_size(new_size);
         let _ = window.set_position(new_pos);
     }
@@ -886,7 +890,7 @@ fn create_settings_window(app: &AppHandle, retry: u8) -> tauri::Result<()> {
     let theme = app.state::<AppState>().settings.read().theme;
     let loaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loaded_on_page = loaded.clone();
-    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
         .title("Hotaru 设置")
         .theme(native_theme(theme))
         .inner_size(540.0, 760.0)
@@ -903,6 +907,7 @@ fn create_settings_window(app: &AppHandle, retry: u8) -> tauri::Result<()> {
             }
         })
         .build()?;
+    crate::window_geometry::restore(&window);
 
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -939,6 +944,25 @@ mod panel_chrome_tests {
     const CHART_HTML: &str = include_str!("../../ui/chart.html");
     /// 1080p monitor at the virtual-desktop origin: `(top, height)`.
     const SCREEN: Option<(f64, f64)> = Some((0.0, 1080.0));
+
+    #[test]
+    fn chart_allows_width_changes_but_locks_content_height() {
+        for height in [300.0, 540.0, 988.0] {
+            let constraints = chart_size_constraints(height);
+            assert_eq!(
+                constraints.min_height,
+                Some(tauri::LogicalUnit(height).into())
+            );
+            assert_eq!(constraints.max_height, constraints.min_height);
+            assert_eq!(
+                constraints.min_width,
+                Some(tauri::LogicalUnit(CHART_W).into())
+            );
+            assert_eq!(constraints.max_width, None);
+        }
+        assert_eq!(clamp_chart_h(540.0, Some(1000.0)), 540.0);
+        assert_eq!(clamp_chart_h(1400.0, Some(1000.0)), 988.0);
+    }
 
     #[test]
     fn grows_downwards_when_anchored_below_the_icon() {
@@ -979,7 +1003,10 @@ mod panel_chrome_tests {
         // nodes that had room to be drawn.
         assert_eq!(clamp_chart_h(1600.0, Some(2000.0)), 1600.0);
         // Past the free space the list scrolls instead of the window growing.
-        assert_eq!(clamp_chart_h(900.0, Some(700.0)), 700.0 - CHART_SCREEN_MARGIN);
+        assert_eq!(
+            clamp_chart_h(900.0, Some(700.0)),
+            700.0 - CHART_SCREEN_MARGIN
+        );
         // Screens too short even for the minimum height still get the minimum.
         assert_eq!(clamp_chart_h(700.0, Some(200.0)), CHART_MIN_H);
         // Unknown monitor falls back to the fixed ceiling.
@@ -1072,7 +1099,14 @@ mod panel_chrome_tests {
             0
         ));
         // Still inside the cooldown after a previous attempt.
-        assert!(!panel_needs_healing(true, false, START, LOADED, now, now - 1));
+        assert!(!panel_needs_healing(
+            true,
+            false,
+            START,
+            LOADED,
+            now,
+            now - 1
+        ));
         assert!(panel_needs_healing(
             true,
             false,

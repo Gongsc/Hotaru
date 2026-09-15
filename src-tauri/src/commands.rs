@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::models::{
@@ -411,10 +411,18 @@ pub fn hide_chart(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn set_chart_pinned(state: State<'_, AppState>, pinned: bool) {
+pub fn set_chart_pinned(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pinned: bool,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("chart") {
+        window.set_always_on_top(pinned).map_err(|e| e.to_string())?;
+    }
     state
         .chart_pinned
         .store(pinned, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
