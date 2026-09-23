@@ -18,7 +18,6 @@
     --warn: #f87171;
     --amber: #fbbf24;
     --traffic: #a78bfa;
-    --off: #9d9da1;
     --tooltip: rgba(239, 239, 242, .96);
     --tooltip-ink: #1d1d1f;
     --tooltip-border: rgba(0, 0, 0, .12);
@@ -239,7 +238,7 @@
   .nrow .ntag.a { color: var(--amber); }
   .nrow .ntag.r { color: var(--warn); }
   .nrow .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--down); }
-  .nrow .dot.off { background: var(--off); }
+  .nrow .dot.off { background: var(--warn); }
   .nrow .chev { flex: none; width: 14px; text-align: center; font-size: 10px; color: var(--ink-2);
                 transition: transform .15s; }
   .card.open > .nrow .chev { transform: rotate(90deg); }
@@ -385,7 +384,7 @@ let rangeSecs = 900;
 let cpuWarnPct = 80, memWarnPct = 85;
 let points = [];                 // aggregate [{t, up, down}]
 let nodeSeries = new Map();      // uuid -> [{t, up, down, online}]
-let nodeMeta = new Map();        // uuid -> {name, online, cpu, memPct, uptime, region, os}
+let nodeMeta = new Map();        // uuid -> {name, online, hasMetrics, cpu, memPct, uptime, region, os, group, ...}
 let expandedUuid = null;         // accordion: which node card is open
 let hiddenNodes = new Set();     // uuids the user unchecked in 设置 → 节点
 let nodeQuery = '';              // 搜索框内容(小写),匹配名称或标签
@@ -397,6 +396,17 @@ let activeGroup = null;
 // 指标模式下的槽位数量,由 buildNodes 建好、patchNodes 就地填值。
 const BADGE_SLOTS = { ping: 2, net: 2, expiry: 1 };
 let nodeBadge = 'tags';
+
+// 这一批节点里有没有标签,由 ingestSnap 顺手算出 —— badgeMode 每次重建列表
+// 都要问好几遍,不能每遍都扫一次 nodeMeta。
+let anyTags = false;
+
+// 实际画出来的徽章。标签是默认值,可后端不一定有标签 —— 极简探针根本没有这个
+// 概念,没打过标签的 Komari 站点也一样 —— 那时这一列会是永远空着的留白,所以
+// 退回网速。用户选的值不动,换个后端还能回到标签。
+function badgeMode() {
+  return nodeBadge === 'tags' && nodeMeta.size && !anyTags ? 'net' : nodeBadge;
+}
 // 排序:再次点同一项就反向。默认按名称升序。
 const SORT_KEYS = [
   ['name', '名称'], ['os', '系统'], ['cpu', 'CPU'], ['mem', '内存'],
@@ -526,16 +536,6 @@ function fmtRemaining(expiredAt) {
   return days + '天';
 }
 
-function trafficUsed(meta) {
-  switch ((meta.trafficLimitType || 'max').toLowerCase()) {
-    case 'sum': return meta.totalUp + meta.totalDown;
-    case 'min': return Math.min(meta.totalUp, meta.totalDown);
-    case 'up': return meta.totalUp;
-    case 'down': return meta.totalDown;
-    default: return Math.max(meta.totalUp, meta.totalDown);
-  }
-}
-
 function fmtAxis(v) {
   if (v >= 1048576) return (v / 1048576).toFixed(1) + 'M';
   if (v >= 1024) return (v / 1024).toFixed(0) + 'K';
@@ -565,6 +565,22 @@ const REGION_CODES = {
   'australia': 'AU', 'russia': 'RU', 'india': 'IN', 'netherlands': 'NL', 'turkey': 'TR',
   'brazil': 'BR', 'china': 'CN',
 };
+
+// 分组名可能是两位国家代码(极简探针按国家分组),直接摆出 "US" 不好认。
+// Intl.DisplayNames 在旧 WebView 上可能没有,取不到就原样显示。
+let regionNames = null;
+try {
+  regionNames = new Intl.DisplayNames(['zh-CN'], { type: 'region' });
+} catch (_) { /* 退回代码本身 */ }
+
+function groupLabel(group) {
+  if (!/^[A-Za-z]{2}$/.test(group)) return group;
+  try {
+    return regionNames ? regionNames.of(group.toUpperCase()) || group : group;
+  } catch (_) {
+    return group;
+  }
+}
 
 function countryCodeOf(region) {
   const r = (region || '').trim();
@@ -950,7 +966,8 @@ function groupUniverse() {
     if (meta.group) groups.add(meta.group);
     else ungrouped = true;
   }
-  const list = [...groups].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  // 按显示名排,不按代码排:列表里看到的是"美国""日本"。
+  const list = [...groups].sort((a, b) => groupLabel(a).localeCompare(groupLabel(b), 'zh-CN'));
   // 后端只给一部分节点配了分组时,剩下的也得有办法单独看
   if (ungrouped && list.length) list.push('');
   return list;
@@ -1052,7 +1069,7 @@ function renderGroupbar() {
   btn.classList.toggle('on', activeGroup !== null);
   const label = activeGroup === null
     ? '按分组筛选'
-    : '按分组筛选（' + (activeGroup || '未分组') + '）';
+    : '按分组筛选（' + (activeGroup ? groupLabel(activeGroup) : '未分组') + '）';
   btn.title = label;
   btn.setAttribute('aria-label', label);
   let cnt = btn.querySelector('.cnt');
@@ -1070,7 +1087,7 @@ function renderGroupbar() {
 
   const pop = document.getElementById('grouppop');
   pop.innerHTML = '';
-  const items = [[null, '全部分组'], ...groups.map((g) => [g, g || '未分组'])];
+  const items = [[null, '全部分组'], ...groups.map((g) => [g, g ? groupLabel(g) : '未分组'])];
   for (const [value, text] of items) {
     const item = document.createElement('button');
     item.type = 'button';
@@ -1176,7 +1193,7 @@ function nodesKeyOf() {
   // 徽章模式换了要重排槽位,同样进 key。
   return visibleUuids()
     .map((uuid) => uuid + ':' + (nodeMeta.get(uuid).tags || []).join('|'))
-    .join(',') + '|' + expandedUuid + '|' + nodeBadge;
+    .join(',') + '|' + expandedUuid + '|' + badgeMode();
 }
 
 function syncNodes() {
@@ -1225,7 +1242,7 @@ function buildNodes() {
       '<span class="name"></span><span class="tags"></span><span class="chev">▶</span>';
     const tagsEl = row.querySelector('.tags');
     const badges = [];
-    if (nodeBadge === 'tags') {
+    if (badgeMode() === 'tags') {
       // 标签来自后端,只用 textContent 写入
       for (const tag of meta.tags || []) {
         const chip = document.createElement('span');
@@ -1235,7 +1252,7 @@ function buildNodes() {
       }
     } else {
       // 指标每次轮询都在变,这里只留空槽,填值交给 patchNodes
-      for (let i = 0; i < (BADGE_SLOTS[nodeBadge] || 1); i++) {
+      for (let i = 0; i < (BADGE_SLOTS[badgeMode()] || 1); i++) {
         const chip = document.createElement('span');
         chip.className = 'ntag num';
         tagsEl.appendChild(chip);
@@ -1323,16 +1340,19 @@ function buildNodes() {
   fitHeight();
 }
 
-// 网络质量:后端 /api/records/ping(每 5 分钟一格,共 1 小时)。
+// 网络质量:后端的探测记录(每 5 分钟一格,共 1 小时)。
 // 延迟行:绿 <100ms / 黄 <200ms / 红 ≥200ms;丢包行:绿 0% / 黄 ≤5% / 红 >5%。
-const pingSeries = new Map(); // uuid -> [{t, v, task_id}] v = 延迟 ms,负值表示该次探测丢包
+// v = 延迟 ms,负值表示这一笔没有回应;loss = 这一笔的丢包比例 0~1。两者不是
+// 一回事:极简探针把一分钟的探测预先聚合成一条记录,只报中位延迟和丢包率,
+// 光数负值会把所有部分丢包都算成零。
+const pingSeries = new Map(); // uuid -> [{t, v, task_id, loss}]
 
 function renderPingGrid(uuid, refs) {
   const now = Date.now();
   const start = now - GRID_BUCKETS * GRID_BUCKET_MS;
   const recs = (pingSeries.get(uuid) || []).filter((p) => p.t >= start);
   const cnt = new Array(GRID_BUCKETS).fill(0);
-  const lossCnt = new Array(GRID_BUCKETS).fill(0);
+  const lossSum = new Array(GRID_BUCKETS).fill(0);
   const latSum = new Array(GRID_BUCKETS).fill(0);
   const latCnt = new Array(GRID_BUCKETS).fill(0);
   const latestAt = new Array(GRID_BUCKETS).fill(0);
@@ -1340,7 +1360,8 @@ function renderPingGrid(uuid, refs) {
     const b = Math.min(GRID_BUCKETS - 1, Math.max(0, Math.floor((p.t - start) / GRID_BUCKET_MS)));
     cnt[b]++;
     latestAt[b] = Math.max(latestAt[b], p.t);
-    if (p.v >= 0) { latSum[b] += p.v; latCnt[b]++; } else { lossCnt[b]++; }
+    if (p.v >= 0) { latSum[b] += p.v; latCnt[b]++; }
+    lossSum[b] += p.loss == null ? (p.v < 0 ? 1 : 0) : p.loss;
   }
   for (let b = 0; b < GRID_BUCKETS; b++) {
     const lat = refs.rowLat.children[b], loss = refs.rowLoss.children[b];
@@ -1357,7 +1378,7 @@ function renderPingGrid(uuid, refs) {
     }
     const avg = latSum[b] / latCnt[b];
     lat.className = !latCnt[b] ? 'r' : avg < 100 ? 'g' : avg < 200 ? 'a' : 'r';
-    const ratio = lossCnt[b] / cnt[b];
+    const ratio = lossSum[b] / cnt[b];
     loss.className = ratio === 0 ? 'g' : ratio <= 0.05 ? 'a' : 'r';
     lat.dataset.tipValue = latCnt[b] ? Math.round(avg) + ' ms' : '无响应';
     loss.dataset.tipValue = (ratio * 100).toFixed(1) + '%';
@@ -1403,7 +1424,8 @@ function setRateChip(chip, arrow, bps, online, label) {
 // 颜色才是一个意思。
 function paintBadges(chips, meta, uuid) {
   if (!chips || !chips.length) return;
-  if (nodeBadge === 'ping') {
+  const mode = badgeMode();
+  if (mode === 'ping') {
     const lat = meta.latency, loss = meta.loss;
     setChip(chips[0], lat == null ? '—' : Math.round(lat) + 'ms',
       lat == null ? '' : lat < 100 ? 'g' : lat < 200 ? 'a' : 'r',
@@ -1411,7 +1433,7 @@ function paintBadges(chips, meta, uuid) {
     setChip(chips[1], loss == null ? '—' : (loss * 100).toFixed(1) + '%',
       loss == null ? '' : loss === 0 ? 'g' : loss <= 0.05 ? 'a' : 'r',
       loss == null ? '丢包：无数据' : '丢包 ' + (loss * 100).toFixed(1) + '%');
-  } else if (nodeBadge === 'net') {
+  } else if (mode === 'net') {
     const s = nodeSeries.get(uuid);
     const last = meta.online ? s && s[s.length - 1] : null;
     setRateChip(chips[0], '↑', last && last.up, !!last, '上行');
@@ -1437,12 +1459,12 @@ function patchNodes() {
       const r = card._refs;
       if (!r) return;
       r.row.querySelector('.dot').className = 'dot' + (meta.online ? '' : ' off');
-      if (nodeBadge !== 'tags') paintBadges(r.badges, meta, uuid);
-      r.upt.textContent = meta.online ? fmtUptime(meta.uptime) : '—';
+      if (badgeMode() !== 'tags') paintBadges(r.badges, meta, uuid);
+      r.upt.textContent = meta.online && meta.hasMetrics ? fmtUptime(meta.uptime) : '—';
       r.expire.textContent = fmtRemaining(meta.expiredAt);
       r.totalUp.textContent = fmtBytes(meta.totalUp);
       r.totalDown.textContent = fmtBytes(meta.totalDown);
-      if (meta.online) {
+      if (meta.online && meta.hasMetrics) {
         const s = nodeSeries.get(uuid);
         const last = s && s[s.length - 1];
         r.rates.textContent = last ? '↑ ' + fmtRate(last.up) + ' · ↓ ' + fmtRate(last.down) : '—';
@@ -1456,15 +1478,20 @@ function patchNodes() {
         r.diskPv.title = meta.diskTotal > 0 ? fmtBytes(meta.diskUsed) + ' / ' + fmtBytes(meta.diskTotal) : '';
         r.diskBar.querySelector('i').style.width = Math.min(100, Math.max(0, meta.diskPct)) + '%';
         r.diskBar.className = 'bar disk' + (meta.diskPct >= 90 ? ' hot' : '');
-        const usedTraffic = trafficUsed(meta);
+        // 额度口径由后端决定(Komari 算累计,极简探针算本月),Rust 侧已经
+        // 折算成一个数,这里只负责画。
+        const usedTraffic = meta.trafficUsed;
         const trafficPct = meta.trafficLimit > 0 ? usedTraffic / meta.trafficLimit * 100 : 0;
         r.trafficPv.textContent = meta.trafficLimit > 0 ? trafficPct.toFixed(0) + '%' : '—';
-        r.trafficPv.title = meta.trafficLimit > 0 ? fmtBytes(usedTraffic) + ' / ' + fmtBytes(meta.trafficLimit) : '未设置流量额度';
+        r.trafficPv.title = meta.trafficLimit > 0
+          ? (meta.trafficPeriod ? meta.trafficPeriod + ' ' : '') + fmtBytes(usedTraffic) + ' / ' + fmtBytes(meta.trafficLimit)
+          : '未设置流量额度';
         r.trafficLbl.title = '计费方式：' + (meta.trafficLimitType || 'max');
         r.trafficBar.querySelector('i').style.width = Math.min(100, Math.max(0, trafficPct)) + '%';
         r.trafficBar.className = 'bar traffic' + (trafficPct >= 90 ? ' hot' : '');
       } else {
-        r.rates.textContent = '离线';
+        // 在线但还没上报(agent 刚连上)和离线是两回事,后者才是故障。
+        r.rates.textContent = meta.online ? '未上报' : '离线';
         r.cpuPv.textContent = '—';
         r.memPv.textContent = '—';
         r.cpuBar.querySelector('i').style.width = '0%';
@@ -1571,7 +1598,9 @@ function ingestSnap(snap) {
     const t = snap.last_update_ms || Date.now();
     nodeMeta = new Map();
     totalUp = 0; totalDown = 0;
+    anyTags = false;
     for (const n of snap.nodes) {
+      if (n.tags && n.tags.length) anyTags = true;
       nodeMeta.set(n.uuid, {
         name: n.name || n.uuid,
         online: !!n.online,
@@ -1584,7 +1613,10 @@ function ingestSnap(snap) {
         totalDown: n.total_down || 0,
         trafficLimit: n.traffic_limit || 0,
         trafficLimitType: n.traffic_limit_type || 'max',
+        trafficUsed: n.traffic_used || 0,
+        trafficPeriod: n.traffic_period || '',
         expiredAt: n.expired_at || null,
+        hasMetrics: n.has_metrics !== false,
         uptime: n.uptime_secs,
         region: n.region || '',
         os: n.os || "",

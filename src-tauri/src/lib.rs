@@ -1,6 +1,7 @@
 mod commands;
+mod engine;
 mod models;
-mod monitor;
+mod providers;
 mod settings;
 mod state;
 mod tray;
@@ -27,9 +28,9 @@ pub fn run() {
             let theme = handle.state::<AppState>().settings.read().theme;
             windows::sync_theme(&handle, theme);
             tray::create(&handle)?;
-            monitor::spawn(handle.clone());
+            engine::spawn(handle.clone());
             windows::spawn_panel_watchdog_loop(&handle);
-            monitor::spawn_ping_loop(handle.clone());
+            engine::spawn_ping_loop(handle.clone());
             // 面板必须在启动时创建:实测经 IPC/命令线程延后创建的 External
             // webview 在本机 WebView2 上会静默失败(白屏且导航不启动)。
             // 静默启动只是不显示它,窗口照旧建好。

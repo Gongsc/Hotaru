@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 #[serde(default, rename_all = "snake_case")]
 pub struct Settings {
     pub backend_url: String,
+    /// Which monitoring backend `backend_url` points at. `Auto` probes the
+    /// site's `/api/nodes` once per engine session and decides from the shape
+    /// of the response; the explicit variants skip that request.
+    pub backend_kind: BackendKind,
     pub api_key: String,
     pub poll_interval_secs: u64,
     pub tray_mode: TrayMode,
@@ -35,6 +39,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             backend_url: String::new(),
+            backend_kind: BackendKind::Auto,
             api_key: String::new(),
             poll_interval_secs: 3,
             tray_mode: TrayMode::Aggregate,
@@ -60,6 +65,18 @@ pub enum ThemeMode {
     System,
     Light,
     Dark,
+}
+
+/// The monitoring backend a site runs. Stored in settings; `Auto` is resolved
+/// to a [`crate::providers::Provider`] at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    #[default]
+    Auto,
+    Komari,
+    /// 极简探针 (`monitor-probe/monitor`).
+    Monitor,
 }
 
 /// What the tray popover puts after a node's name in the collapsed row. The
@@ -113,17 +130,8 @@ impl Settings {
     }
 }
 
-/// Komari keeps a node's tags in one `;`-separated string.
-pub fn split_tags(raw: &str) -> Vec<String> {
-    raw.split(';')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// One ping-monitor probe.
-#[derive(Serialize, Clone, Copy, Debug)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct PingPoint {
     /// Epoch milliseconds.
     pub t: u64,
@@ -131,10 +139,28 @@ pub struct PingPoint {
     pub v: f64,
     /// Ping task identity, used to average the latest result per target.
     pub task_id: u64,
+    /// Share of probes lost for this sample, 0.0–1.0.
+    ///
+    /// Komari reports one probe per record, so this is only ever 0 or 1 there
+    /// and carries the same information `v < 0` does. 极简探针 pre-aggregates
+    /// a minute of probes into one record and reports the losses separately —
+    /// counting negative `v` would miss every partial loss, which is why the
+    /// popover's quality grid reads this field instead.
+    pub loss: Option<f64>,
+}
+
+/// One node's cached ping window: the samples the popover's quality grid
+/// draws, and the headline figures its card shows. Kept together because the
+/// two are not always derived from one another — 极简探针 reports the window's
+/// loss separately from the samples, which no longer carry the failures.
+#[derive(Clone, Default, Debug)]
+pub struct PingData {
+    pub points: Vec<PingPoint>,
+    pub summary: PingSummary,
 }
 
 /// Latest ping figures for one node, as a node card shows them.
-#[derive(Serialize, Default, PartialEq, Debug)]
+#[derive(Serialize, Clone, Default, PartialEq, Debug)]
 pub struct PingSummary {
     /// Mean of each task's most recent successful probe, in ms. `None` when no
     /// task has a successful probe in the window.
@@ -169,7 +195,15 @@ pub fn summarize_ping(points: &[PingPoint]) -> PingSummary {
         loss: if points.is_empty() {
             None
         } else {
-            Some(points.iter().filter(|p| p.v < 0.0).count() as f64 / points.len() as f64)
+            // `loss` where the provider filled it, the sign of `v` otherwise —
+            // the same answer for a provider that reports one probe per record.
+            Some(
+                points
+                    .iter()
+                    .map(|p| p.loss.unwrap_or(if p.v < 0.0 { 1.0 } else { 0.0 }))
+                    .sum::<f64>()
+                    / points.len() as f64,
+            )
         },
     }
 }
@@ -217,11 +251,34 @@ pub struct NodeSnapshot {
     pub traffic_limit: u64,
     #[serde(default)]
     pub traffic_limit_type: String,
+    /// Bytes counted against `traffic_limit`, decided by the provider: Komari
+    /// bills the lifetime totals, 极简探针 a calendar month that resets on the
+    /// node's own reset day. Computed here rather than in the popover so the
+    /// two cannot be confused for one another.
+    #[serde(default)]
+    pub traffic_used: u64,
+    /// Which period `traffic_used` covers, for the quota tooltip: "累计" or
+    /// "本月".
+    #[serde(default)]
+    pub traffic_period: String,
     #[serde(default)]
     pub expired_at: Option<String>,
     pub tcp: u64,
     pub udp: u64,
     pub uptime_secs: u64,
+    /// Whether the figures above came from a real report.
+    ///
+    /// 极简探针 has a third state beside online and offline: a node whose agent
+    /// has just reconnected is `online` with no metrics at all. Treating that
+    /// as "online at 0% CPU" would drag the fleet average down and light up the
+    /// popover with zeroes, so it is flagged instead. Komari has no equivalent
+    /// signal and always sets this.
+    #[serde(default = "default_true")]
+    pub has_metrics: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,21 +358,25 @@ pub fn scoped_nodes<'a>(settings: &Settings, nodes: &'a [NodeSnapshot]) -> Vec<&
 
 pub fn aggregate(nodes: &[&NodeSnapshot]) -> Aggregate {
     let total = nodes.len();
+    // `online` counts what the popover's header counts, while the averages and
+    // sums below need figures to average: a node that is connected but has not
+    // reported yet contributes zeroes to every metric it is included in.
     let online: Vec<&&NodeSnapshot> = nodes.iter().filter(|n| n.online).collect();
-    let count = online.len().max(1) as f64;
-    let ram_used: u64 = online.iter().map(|n| n.ram_used).sum();
-    let ram_total: u64 = online.iter().map(|n| n.ram_total).sum();
+    let reporting: Vec<&&NodeSnapshot> = online.iter().copied().filter(|n| n.has_metrics).collect();
+    let count = reporting.len().max(1) as f64;
+    let ram_used: u64 = reporting.iter().map(|n| n.ram_used).sum();
+    let ram_total: u64 = reporting.iter().map(|n| n.ram_total).sum();
     Aggregate {
         online: online.len(),
         total,
-        cpu: online.iter().map(|n| n.cpu_usage).sum::<f64>() / count,
+        cpu: reporting.iter().map(|n| n.cpu_usage).sum::<f64>() / count,
         mem_pct: pct(ram_used, ram_total).unwrap_or(0.0),
         ram_used,
         ram_total,
-        net_up: online.iter().map(|n| n.net_up).sum(),
-        net_down: online.iter().map(|n| n.net_down).sum(),
-        total_up: online.iter().map(|n| n.total_up).sum(),
-        total_down: online.iter().map(|n| n.total_down).sum(),
+        net_up: reporting.iter().map(|n| n.net_up).sum(),
+        net_down: reporting.iter().map(|n| n.net_down).sum(),
+        total_up: reporting.iter().map(|n| n.total_up).sum(),
+        total_down: reporting.iter().map(|n| n.total_down).sum(),
     }
 }
 
@@ -375,7 +436,8 @@ pub fn icon_state(settings: &Settings, snap: &MonitorSnapshot) -> IconState {
     let mut gauge: Option<f64> = None;
     let mut severity = Severity::Ok;
     let err_threshold = |warn: f64| (warn + 15.0).min(100.0);
-    for n in &online {
+    // Connected but not yet reporting is not 0% CPU; see `NodeSnapshot::has_metrics`.
+    for n in online.iter().filter(|n| n.has_metrics) {
         for (value, warn) in [
             (n.cpu_usage, settings.cpu_warn_pct),
             (
@@ -468,6 +530,34 @@ pub fn ws_url_of(base: &str) -> Result<String, String> {
     Ok(format!("{ws}/api/clients"))
 }
 
+/// Minimal RFC3339 UTC parser ("2026-08-29T16:50:00Z", fractional seconds
+/// allowed but ignored) — avoids pulling a full date-time crate.
+pub fn parse_rfc3339_ms(s: &str) -> Option<u64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
+    let y = num(0, 4)?;
+    let mo = num(5, 7)?;
+    let d = num(8, 10)?;
+    let h = num(11, 13)?;
+    let mi = num(14, 16)?;
+    let sec = num(17, 19)?;
+    let days = days_from_civil(y, mo, d);
+    Some(((days * 86400 + h * 3600 + mi * 60 + sec) * 1000) as u64)
+}
+
+/// Howard Hinnant's days_from_civil: days since 1970-01-01 for a civil date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -508,155 +598,6 @@ pub fn fmt_uptime(secs: u64) -> String {
         format!("{h}小时{m}分")
     } else {
         format!("{m}分钟")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Komari wire format (parsed payloads)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct Envelope<T> {
-    pub status: String,
-    #[serde(default)]
-    pub data: Option<T>,
-    #[serde(default)]
-    pub message: Option<String>,
-}
-
-/// `GET /api/nodes` list item — only the fields we display; tolerant to
-/// snake_case and camelCase spellings across Komari versions.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-#[allow(dead_code)]
-pub struct ClientInfo {
-    #[serde(default)]
-    pub uuid: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub region: String,
-    #[serde(default, alias = "memTotal")]
-    pub mem_total: u64,
-    #[serde(default, alias = "osAlias", alias = "osName")]
-    pub os: String,
-    /// A node's group, unlike its tags, is a single plain name.
-    #[serde(default)]
-    pub group: String,
-    /// `;`-separated in Komari's API; see [`split_tags`].
-    #[serde(default)]
-    pub tags: String,
-    #[serde(default, alias = "trafficLimit")]
-    pub traffic_limit: u64,
-    #[serde(default, alias = "trafficLimitType")]
-    pub traffic_limit_type: String,
-    #[serde(default, alias = "expiredAt")]
-    pub expired_at: Option<String>,
-}
-
-impl Default for ClientInfo {
-    fn default() -> Self {
-        Self {
-            uuid: String::new(),
-            name: String::new(),
-            region: String::new(),
-            mem_total: 0,
-            os: String::new(),
-            group: String::new(),
-            tags: String::new(),
-            traffic_limit: 0,
-            traffic_limit_type: String::new(),
-            expired_at: None,
-        }
-    }
-}
-
-/// WebSocket `{"status":"success","data":{"online":[...],"data":{...}}}`.
-#[derive(Debug, Deserialize, Default)]
-pub struct WsPayload {
-    #[serde(default)]
-    pub online: Vec<String>,
-    #[serde(default)]
-    pub data: std::collections::HashMap<String, Report>,
-}
-
-/// Live report (`/api/recent/{uuid}` item and `/api/clients` WS value).
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Report {
-    pub cpu: Option<Usage>,
-    pub ram: Option<Mem>,
-    pub swap: Option<Mem>,
-    pub disk: Option<Mem>,
-    pub network: Option<NetStat>,
-    pub connections: Option<Conns>,
-    #[serde(alias = "uptime")]
-    pub uptime: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Usage {
-    pub usage: Option<f64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Mem {
-    pub total: Option<u64>,
-    pub used: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct NetStat {
-    pub up: Option<f64>,
-    pub down: Option<f64>,
-    #[serde(default, alias = "totalUp")]
-    pub total_up: Option<u64>,
-    #[serde(default, alias = "totalDown")]
-    pub total_down: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Conns {
-    pub tcp: Option<u64>,
-    pub udp: Option<u64>,
-}
-
-pub fn report_to_snapshot(info: &ClientInfo, online: bool, r: &Report) -> NodeSnapshot {
-    NodeSnapshot {
-        uuid: info.uuid.clone(),
-        name: if info.name.is_empty() {
-            format!("节点 {}", &info.uuid[..info.uuid.len().min(8)])
-        } else {
-            info.name.clone()
-        },
-        online,
-        region: info.region.clone(),
-        os: info.os.clone(),
-        group: info.group.clone(),
-        tags: split_tags(&info.tags),
-        latency: None,
-        loss: None,
-        cpu_usage: r.cpu.as_ref().and_then(|c| c.usage).unwrap_or(0.0),
-        ram_used: r.ram.as_ref().and_then(|m| m.used).unwrap_or(0),
-        ram_total: r.ram.as_ref().and_then(|m| m.total).unwrap_or(0),
-        swap_used: r.swap.as_ref().and_then(|m| m.used).unwrap_or(0),
-        swap_total: r.swap.as_ref().and_then(|m| m.total).unwrap_or(0),
-        disk_used: r.disk.as_ref().and_then(|m| m.used).unwrap_or(0),
-        disk_total: r.disk.as_ref().and_then(|m| m.total).unwrap_or(0),
-        net_up: r.network.as_ref().and_then(|n| n.up).unwrap_or(0.0),
-        net_down: r.network.as_ref().and_then(|n| n.down).unwrap_or(0.0),
-        total_up: r.network.as_ref().and_then(|n| n.total_up).unwrap_or(0),
-        total_down: r.network.as_ref().and_then(|n| n.total_down).unwrap_or(0),
-        traffic_limit: info.traffic_limit,
-        traffic_limit_type: info.traffic_limit_type.clone(),
-        expired_at: info.expired_at.clone(),
-        tcp: r.connections.as_ref().and_then(|c| c.tcp).unwrap_or(0),
-        udp: r.connections.as_ref().and_then(|c| c.udp).unwrap_or(0),
-        uptime_secs: r.uptime.unwrap_or(0),
     }
 }
 
@@ -724,6 +665,23 @@ mod tests {
     }
 
     #[test]
+    fn rfc3339_parse_epoch() {
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_ms("1970-01-02T00:00:00Z"), Some(86_400_000));
+        // 2024-02-29 (leap day) 00:00 UTC
+        assert_eq!(
+            parse_rfc3339_ms("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800_000)
+        );
+        // fractional seconds ignored
+        assert_eq!(
+            parse_rfc3339_ms("2024-02-29T00:00:00.123456Z"),
+            Some(1_709_164_800_000)
+        );
+        assert_eq!(parse_rfc3339_ms("not-a-date"), None);
+    }
+
+    #[test]
     fn formats() {
         assert_eq!(fmt_rate(512.0), "512B/s");
         assert_eq!(fmt_rate(2048.0), "2.0KB/s");
@@ -732,124 +690,99 @@ mod tests {
         assert_eq!(fmt_uptime(300), "5分钟");
     }
 
-    fn sample_ws_json() -> String {
-        r#"{
-          "status": "success",
-          "data": {
-            "online": ["uuid-1"],
-            "data": {
-              "uuid-1": {
-                "cpu": {"usage": 42.5},
-                "ram": {"total": 8589934592, "used": 4294967296},
-                "swap": {"total": 1073741824, "used": 0},
-                "disk": {"total": 107374182400, "used": 53687091200},
-                "network": {"up": 128.0, "down": 3567155.2, "totalUp": 1024, "totalDown": 2048},
-                "connections": {"tcp": 120, "udp": 8},
-                "uptime": 98765
-              },
-              "uuid-2": {
-                "cpu": {"usage": 91.0},
-                "ram": {"total": 4294967296, "used": 2147483648}
-              }
-            }
-          }
-        }"#
-        .to_string()
-    }
-
-    #[test]
-    fn parse_ws_payload() {
-        let env: Envelope<WsPayload> = serde_json::from_str(&sample_ws_json()).unwrap();
-        let payload = env.data.unwrap();
-        assert_eq!(payload.online, vec!["uuid-1".to_string()]);
-        assert_eq!(payload.data.len(), 2);
-        let rep = payload.data.get("uuid-1").unwrap();
-        let info = ClientInfo {
-            uuid: "uuid-1".into(),
-            name: "node-1".into(),
-            traffic_limit: 1_000_000,
-            traffic_limit_type: "sum".into(),
-            expired_at: Some("2027-01-01T00:00:00Z".into()),
-            ..Default::default()
-        };
-        let snap = report_to_snapshot(&info, true, rep);
-        assert_eq!(snap.name, "node-1");
-        assert!((snap.cpu_usage - 42.5).abs() < 1e-9);
-        assert_eq!(snap.ram_used, 4294967296);
-        assert!((snap.net_down - 3567155.2).abs() < 1e-9);
-        assert_eq!(snap.tcp, 120);
-        assert_eq!(snap.traffic_limit, 1_000_000);
-        assert_eq!(snap.traffic_limit_type, "sum");
-        assert_eq!(snap.expired_at.as_deref(), Some("2027-01-01T00:00:00Z"));
-        // unknown node gets a fallback name
-        let rep2 = payload.data.get("uuid-2").unwrap();
-        let info2 = ClientInfo {
-            uuid: "uuid-2".into(),
-            ..Default::default()
-        };
-        let snap2 = report_to_snapshot(&info2, false, rep2);
-        assert_eq!(snap2.name, "节点 uuid-2");
-        assert_eq!(snap2.uptime_secs, 0);
-    }
-
-    #[test]
-    fn client_info_parses_billing_metadata() {
-        let info: ClientInfo = serde_json::from_str(
-            r#"{
-          "uuid":"node-1",
-          "name":"Tokyo",
-          "traffic_limit":1099511627776,
-          "traffic_limit_type":"sum",
-          "expired_at":"2027-06-30T00:00:00Z"
-        }"#,
-        )
-        .unwrap();
-        assert_eq!(info.traffic_limit, 1_099_511_627_776);
-        assert_eq!(info.traffic_limit_type, "sum");
-        assert_eq!(info.expired_at.as_deref(), Some("2027-06-30T00:00:00Z"));
-    }
-
-    #[test]
-    fn group_reaches_the_snapshot_and_is_optional() {
-        let info: ClientInfo =
-            serde_json::from_str(r#"{"uuid":"u","group":"\u751f\u4ea7"}"#).unwrap();
-        assert_eq!(info.group, "生产");
-        let snap = report_to_snapshot(&info, true, &Report::default());
-        assert_eq!(snap.group, "生产");
-
-        // Komari versions without groups simply leave the node ungrouped.
-        let plain: ClientInfo = serde_json::from_str(r#"{"uuid":"u"}"#).unwrap();
-        assert!(report_to_snapshot(&plain, true, &Report::default())
-            .group
-            .is_empty());
-    }
-
     #[test]
     fn aggregate_math() {
-        let mut names = std::collections::HashMap::new();
-        names.insert("uuid-1".to_string(), "node-1".to_string());
-        let env: Envelope<WsPayload> = serde_json::from_str(&sample_ws_json()).unwrap();
-        let payload = env.data.unwrap();
-        let nodes: Vec<NodeSnapshot> = payload
-            .data
-            .iter()
-            .map(|(uuid, rep)| {
-                let online = payload.online.iter().any(|o| o == uuid);
-                let info = ClientInfo {
-                    uuid: uuid.clone(),
-                    name: names.get(uuid).cloned().unwrap_or_default(),
-                    ..Default::default()
-                };
-                report_to_snapshot(&info, online, rep)
-            })
-            .collect();
+        let nodes = [
+            NodeSnapshot {
+                uuid: "a".into(),
+                cpu_usage: 42.5,
+                ram_used: 4_294_967_296,
+                ram_total: 8_589_934_592,
+                net_down: 3_567_155.2,
+                total_down: 100,
+                ..NodeSnapshot::test_default()
+            },
+            NodeSnapshot {
+                uuid: "b".into(),
+                online: false,
+                cpu_usage: 99.0,
+                ram_used: 1,
+                ram_total: 2,
+                net_down: 1.0,
+                total_down: 1,
+                ..NodeSnapshot::test_default()
+            },
+        ];
         let agg = aggregate(&nodes.iter().collect::<Vec<_>>());
         assert_eq!(agg.total, 2);
         assert_eq!(agg.online, 1);
+        // Offline nodes contribute to neither the averages nor the sums.
         assert!((agg.cpu - 42.5).abs() < 1e-9);
         assert!((agg.mem_pct - 50.0).abs() < 1e-9);
-        assert!((agg.net_down - 3567155.2).abs() < 1e-9);
-        assert_eq!(agg.ram_total, 8589934592);
+        assert!((agg.net_down - 3_567_155.2).abs() < 1e-9);
+        assert_eq!(agg.ram_total, 8_589_934_592);
+        assert_eq!(agg.total_down, 100);
+    }
+
+    #[test]
+    fn aggregate_skips_online_nodes_without_metrics() {
+        let nodes = [
+            NodeSnapshot {
+                uuid: "reporting".into(),
+                cpu_usage: 40.0,
+                ram_used: 512,
+                ram_total: 1024,
+                net_up: 10.0,
+                ..NodeSnapshot::test_default()
+            },
+            // Connected, but its agent has not sent a report yet.
+            NodeSnapshot {
+                uuid: "silent".into(),
+                has_metrics: false,
+                ..NodeSnapshot::test_default()
+            },
+        ];
+        let agg = aggregate(&nodes.iter().collect::<Vec<_>>());
+        // Still counted as online — it is — but averaged over one node, not two,
+        // so the empty report cannot halve the fleet's CPU.
+        assert_eq!(agg.online, 2);
+        assert!((agg.cpu - 40.0).abs() < 1e-9);
+        assert!((agg.mem_pct - 50.0).abs() < 1e-9);
+        assert!((agg.net_up - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn icon_severity_ignores_online_nodes_without_metrics() {
+        let settings = Settings::default();
+        let warn = NodeSnapshot {
+            uuid: "warn".into(),
+            cpu_usage: 95.0,
+            ..NodeSnapshot::test_default()
+        };
+        let snap = MonitorSnapshot {
+            backend_ok: true,
+            error: None,
+            nodes: vec![
+                NodeSnapshot {
+                    has_metrics: false,
+                    ..warn.clone()
+                },
+                NodeSnapshot {
+                    uuid: "idle".into(),
+                    cpu_usage: 1.0,
+                    ..NodeSnapshot::test_default()
+                },
+            ],
+            last_update_ms: 0,
+        };
+        // The 95% belongs to a node that never reported it.
+        assert_eq!(icon_state(&settings, &snap).severity, Severity::Ok);
+
+        let reported = MonitorSnapshot {
+            nodes: vec![warn],
+            ..snap
+        };
+        assert_eq!(icon_state(&settings, &reported).severity, Severity::Err);
     }
 
     #[test]
@@ -955,7 +888,12 @@ mod tests {
 
     #[test]
     fn ping_summary_averages_the_latest_probe_per_task() {
-        let p = |t, v, task_id| PingPoint { t, v, task_id };
+        let p = |t, v: f64, task_id| PingPoint {
+            t,
+            v,
+            task_id,
+            loss: None,
+        };
         // Task 7 last succeeded at 40ms, task 9 at 60ms -> mean 50ms. The older
         // 10ms sample must not count, and the lost probe (-1) is 1 of 4 records.
         let points = [p(1, 10.0, 7), p(2, 40.0, 7), p(3, -1.0, 9), p(4, 60.0, 9)];
@@ -975,17 +913,24 @@ mod tests {
 
         // No records at all -> nothing known, so the node sorts last either way.
         assert_eq!(summarize_ping(&[]), PingSummary::default());
-    }
 
-    #[test]
-    fn tags_split_on_semicolons() {
-        assert_eq!(split_tags("hk;bgp"), vec!["hk", "bgp"]);
-        // Komari lets the field be blank, ragged or padded.
-        assert_eq!(split_tags(" hk ; ; bgp;"), vec!["hk", "bgp"]);
-        assert!(split_tags("").is_empty());
-        assert!(split_tags(";;").is_empty());
-        // commas are not separators, they stay inside one tag
-        assert_eq!(split_tags("hk,bgp"), vec!["hk,bgp"]);
+        // A provider that pre-aggregates a bucket reports its loss share
+        // directly; the sign of `v` would call this bucket lossless.
+        let aggregated = [
+            PingPoint {
+                t: 1,
+                v: 30.0,
+                task_id: 7,
+                loss: Some(0.5),
+            },
+            PingPoint {
+                t: 2,
+                v: 30.0,
+                task_id: 9,
+                loss: Some(0.0),
+            },
+        ];
+        assert_eq!(summarize_ping(&aggregated).loss, Some(0.25));
     }
 
     #[test]
@@ -1036,10 +981,13 @@ mod tests {
                 total_down: 0,
                 traffic_limit: 0,
                 traffic_limit_type: String::new(),
+                traffic_used: 0,
+                traffic_period: String::new(),
                 expired_at: None,
                 tcp: 0,
                 udp: 0,
                 uptime_secs: 0,
+                has_metrics: true,
             }
         }
     }

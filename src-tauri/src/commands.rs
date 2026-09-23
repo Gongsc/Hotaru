@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as _;
 
+use crate::engine;
 use crate::models::{
-    normalize_base, now_ms, ClientInfo, Envelope, MonitorSnapshot, NetPoint, PingPoint, Settings,
+    normalize_base, now_ms, BackendKind, MonitorSnapshot, NetPoint, PingPoint, Settings,
 };
+use crate::providers::{self, Provider};
 use crate::settings;
 use crate::state::AppState;
 use crate::windows;
@@ -138,6 +140,7 @@ pub fn save_settings(
     // popover keeps listing the previous backend's nodes — and charting their
     // history — until the engine finishes reconnecting.
     let target_changed = previous.backend_url != s.backend_url
+        || previous.backend_kind != s.backend_kind
         || previous.api_key != s.api_key
         || previous.accept_invalid_certs != s.accept_invalid_certs;
     *state.settings.write() = s.clone();
@@ -204,12 +207,17 @@ pub fn get_net_history(state: State<'_, AppState>, range_secs: u64) -> NetHistor
     }
 
     NetHistoryPayload {
-        aggregate: downsample(&frames.iter().map(|f| NetPoint {
-            t: f.t,
-            up: f.nodes.iter().map(|(_, up, _, _)| up).sum(),
-            down: f.nodes.iter().map(|(_, _, down, _)| down).sum(),
-            online: true,
-        }).collect::<Vec<_>>()),
+        aggregate: downsample(
+            &frames
+                .iter()
+                .map(|f| NetPoint {
+                    t: f.t,
+                    up: f.nodes.iter().map(|(_, up, _, _)| up).sum(),
+                    down: f.nodes.iter().map(|(_, _, down, _)| down).sum(),
+                    online: true,
+                })
+                .collect::<Vec<_>>(),
+        ),
         nodes: nodes
             .into_iter()
             .map(|(uuid, pts)| (uuid, downsample(&pts)))
@@ -252,57 +260,8 @@ pub struct NodeOption {
 #[tauri::command]
 pub async fn list_nodes(settings: Settings) -> Result<Vec<NodeOption>, String> {
     let s = settings.sanitized();
-    let base = normalize_base(&s.backend_url)?;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(s.accept_invalid_certs)
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.get(format!("{base}/api/nodes"));
-    if !s.api_key.is_empty() {
-        req = req.bearer_auth(&s.api_key);
-    }
-    let resp = req.send().await.map_err(|e| format!("无法连接后端: {e}"))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(
-            "HTTP 401：站点为私有模式，需要 API Key（管理后台 → 设置 → API Key）".into(),
-        );
-    }
-    if !status.is_success() {
-        return Err(format!("后端返回 HTTP {status}"));
-    }
-    let env: Envelope<Vec<ClientInfo>> = resp
-        .json()
-        .await
-        .map_err(|e| format!("响应不是有效的 Komari API: {e}"))?;
-    if env.status != "success" {
-        return Err(format!(
-            "后端返回错误: {}{}",
-            env.status,
-            env.message.map(|m| format!("（{m}）")).unwrap_or_default()
-        ));
-    }
-    Ok(env
-        .data
-        .unwrap_or_default()
-        .into_iter()
-        .map(|info| NodeOption {
-            name: node_display_name(&info),
-            tags: crate::models::split_tags(&info.tags),
-            uuid: info.uuid,
-        })
-        .collect())
-}
-
-/// Same fallback the monitor uses, so the picker and the popover agree on the
-/// label of a node whose name the backend left empty.
-fn node_display_name(info: &ClientInfo) -> String {
-    if info.name.trim().is_empty() {
-        format!("节点 {}", &info.uuid[..info.uuid.len().min(8)])
-    } else {
-        info.name.clone()
-    }
+    let (_, _, nodes) = probe(&s).await?;
+    Ok(nodes)
 }
 
 #[derive(Serialize)]
@@ -316,39 +275,106 @@ pub struct TestResult {
 #[tauri::command]
 pub async fn test_connection(settings: Settings) -> Result<TestResult, String> {
     let s = settings.sanitized();
+    let (provider, version, nodes) = probe(&s).await?;
+    let count = nodes.len();
+    Ok(TestResult {
+        ok: true,
+        node_count: count,
+        message: match version.is_empty() {
+            true => format!("连接成功（{}），发现 {count} 个节点", provider.label()),
+            false => format!(
+                "连接成功（{} · {version}），发现 {count} 个节点",
+                provider.label()
+            ),
+        },
+        version,
+    })
+}
+
+/// One `/api/nodes` round trip serving both commands above: which backend
+/// answered, something to show as its version, and the node list.
+///
+/// The response body is what identifies the backend, so detection costs no
+/// extra request — and `list_nodes` must work before the connection has ever
+/// been saved, which rules out reading the engine's resolved provider here.
+async fn probe(s: &Settings) -> Result<(Provider, String, Vec<NodeOption>), String> {
     let base = normalize_base(&s.backend_url)?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(s.accept_invalid_certs)
         .timeout(Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut req = client.get(format!("{base}/api/nodes"));
-    if !s.api_key.is_empty() {
-        req = req.bearer_auth(&s.api_key);
-    }
-    let resp = req.send().await.map_err(|e| format!("无法连接后端: {e}"))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(
-            "HTTP 401：站点为私有模式，需要 API Key（管理后台 → 设置 → API Key）".into(),
-        );
-    }
-    if !status.is_success() {
-        return Err(format!("后端返回 HTTP {status}"));
-    }
-    let env: Envelope<Vec<ClientInfo>> = resp
-        .json()
+
+    // Carries the API Key so a private Komari site answers rather than 401s;
+    // a 极简探针 hub authenticates by cookie and ignores the header.
+    let text = providers::monitor::fetch_nodes_text(&client, &base, &s.api_key)
         .await
-        .map_err(|e| format!("响应不是有效的 Komari API: {e}"))?;
-    if env.status != "success" {
+        .map_err(|e| e.explain(unauthorized_hint(s.backend_kind)))?;
+
+    let looks_like = providers::sniff(&text);
+    let provider = match s.backend_kind {
+        BackendKind::Komari => Provider::Komari,
+        BackendKind::Monitor => Provider::Monitor,
+        BackendKind::Auto => {
+            looks_like.ok_or_else(|| "响应既不是 Komari 也不是极简探针的 /api/nodes".to_string())?
+        }
+    };
+    // Picking the wrong type by hand is easy now that there is a picker, and
+    // the parse error it produces ("missing field `status`") reads like a
+    // broken site rather than a setting to change.
+    if let Some(actual) = looks_like.filter(|a| *a != provider) {
         return Err(format!(
-            "后端返回错误: {}{}",
-            env.status,
-            env.message.map(|m| format!("（{m}）")).unwrap_or_default()
+            "后端类型选的是 {}，但这个站点看起来是 {}",
+            provider.label(),
+            actual.label()
         ));
     }
-    let count = env.data.as_ref().map(|v| v.len()).unwrap_or(0);
-    let version = match client.get(format!("{base}/api/version")).send().await {
+
+    match provider {
+        Provider::Komari => {
+            let mut nodes: Vec<NodeOption> = providers::komari::parse_nodes(&text)?
+                .into_values()
+                .map(|info| NodeOption {
+                    name: komari_display_name(&info),
+                    tags: providers::komari::split_tags(&info.tags),
+                    uuid: info.uuid,
+                })
+                .collect();
+            nodes.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok((provider, komari_version(&client, &base).await, nodes))
+        }
+        Provider::Monitor => {
+            let nodes = providers::monitor::parse_frame(&text)?
+                .into_iter()
+                .map(|n| NodeOption {
+                    uuid: n.uuid,
+                    name: n.name,
+                    tags: n.tags,
+                })
+                .collect();
+            // The hub has no /api/version; its own name is the useful thing to
+            // echo back, and seeing it confirms the site really is a hub.
+            let name = providers::monitor::fetch_site_name(&client, &base)
+                .await
+                .unwrap_or_default();
+            Ok((provider, name, nodes))
+        }
+    }
+}
+
+/// What a 401 means, as far as the configured kind reveals.
+fn unauthorized_hint(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Komari => {
+            "HTTP 401：站点为私有模式，需要 API Key（管理后台 → 设置 → API Key）"
+        }
+        BackendKind::Monitor => providers::monitor::NEEDS_PUBLIC_PAGE,
+        BackendKind::Auto => providers::UNAUTHORIZED_UNKNOWN_KIND,
+    }
+}
+
+async fn komari_version(client: &reqwest::Client, base: &str) -> String {
+    match client.get(format!("{base}/api/version")).send().await {
         Ok(r) if r.status().is_success() => r
             .json::<serde_json::Value>()
             .await
@@ -356,13 +382,17 @@ pub async fn test_connection(settings: Settings) -> Result<TestResult, String> {
             .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(String::from))
             .unwrap_or_default(),
         _ => String::new(),
-    };
-    Ok(TestResult {
-        ok: true,
-        node_count: count,
-        version,
-        message: format!("连接成功，发现 {count} 个节点"),
-    })
+    }
+}
+
+/// Same fallback the Komari provider uses, so the picker and the popover agree
+/// on the label of a node whose name the backend left empty.
+fn komari_display_name(info: &providers::komari::ClientInfo) -> String {
+    if info.name.trim().is_empty() {
+        format!("节点 {}", &info.uuid[..info.uuid.len().min(8)])
+    } else {
+        info.name.clone()
+    }
 }
 
 #[tauri::command]
@@ -417,7 +447,9 @@ pub fn set_chart_pinned(
     pinned: bool,
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("chart") {
-        window.set_always_on_top(pinned).map_err(|e| e.to_string())?;
+        window
+            .set_always_on_top(pinned)
+            .map_err(|e| e.to_string())?;
     }
     state
         .chart_pinned
@@ -440,7 +472,6 @@ pub fn resize_chart(app: AppHandle, height: f64) -> f64 {
     windows::resize_chart(&app, height)
 }
 
-
 /// Serve the ping records the monitor already keeps for this node. The engine
 /// refreshes them in the background like every other node figure, so expanding
 /// a card no longer waits on a request; only a node the loop has not covered
@@ -452,65 +483,21 @@ pub async fn get_ping_records(
     hours: u64,
 ) -> Result<Vec<PingPoint>, String> {
     if let Some(cached) = state.ping_records.read().get(&uuid) {
-        return Ok(cached.clone());
+        return Ok(cached.points.clone());
     }
+    let provider = state
+        .provider
+        .read()
+        .ok_or_else(|| "尚未连接后端".to_string())?;
     let s = state.settings.read().clone().sanitized();
     let base = normalize_base(&s.backend_url)?;
     let hours = hours.clamp(1, 24);
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(s.accept_invalid_certs)
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    crate::monitor::fetch_ping_records(&client, &base, &s.api_key, &uuid, hours)
+    let client = engine::build_client(&s);
+    provider
+        .fetch_ping(&client, &base, &s.api_key, &uuid, hours)
         .await
+        .map(|(points, _)| points)
         .ok_or_else(|| "无法获取 ping 记录".to_string())
-}
-
-pub(crate) fn parse_ping_records(body: &serde_json::Value) -> Vec<PingPoint> {
-    let mut out = Vec::new();
-    if let Some(records) = body.pointer("/data/records").and_then(|v| v.as_array()) {
-        for r in records {
-            let Some(v) = r.get("value").and_then(|x| x.as_f64()) else {
-                continue;
-            };
-            let task_id = r.get("task_id").and_then(|x| x.as_u64()).unwrap_or(0);
-            let time = r.get("time").and_then(|x| x.as_str()).unwrap_or("");
-            if let Some(t) = parse_rfc3339_ms(time) {
-                out.push(PingPoint { t, v, task_id });
-            }
-        }
-    }
-    out.sort_by_key(|p| p.t);
-    out
-}
-
-/// Minimal RFC3339 UTC parser ("2026-08-29T16:50:00Z", fractional seconds
-/// allowed but ignored) — avoids pulling a full date-time crate.
-fn parse_rfc3339_ms(s: &str) -> Option<u64> {
-    if s.len() < 19 {
-        return None;
-    }
-    let num = |a: usize, b: usize| s.get(a..b)?.parse::<i64>().ok();
-    let y = num(0, 4)?;
-    let mo = num(5, 7)?;
-    let d = num(8, 10)?;
-    let h = num(11, 13)?;
-    let mi = num(14, 16)?;
-    let sec = num(17, 19)?;
-    let days = days_from_civil(y, mo, d);
-    Some(((days * 86400 + h * 3600 + mi * 60 + sec) * 1000) as u64)
-}
-
-/// Howard Hinnant's days_from_civil: days since 1970-01-01 for a civil date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
 }
 
 #[cfg(test)]
@@ -518,7 +505,12 @@ mod tests {
     use super::*;
 
     fn pt(t: u64, up: f64) -> NetPoint {
-        NetPoint { t, up, down: up, online: true }
+        NetPoint {
+            t,
+            up,
+            down: up,
+            online: true,
+        }
     }
 
     #[test]
@@ -539,39 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_parse_epoch() {
-        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_ms("1970-01-02T00:00:00Z"), Some(86_400_000));
-        // 2024-02-29 (leap day) 00:00 UTC
-        assert_eq!(parse_rfc3339_ms("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
-        // fractional seconds ignored
-        assert_eq!(
-            parse_rfc3339_ms("2024-02-29T00:00:00.123456Z"),
-            Some(1_709_164_800_000)
-        );
-        assert_eq!(parse_rfc3339_ms("not-a-date"), None);
-    }
-
-    #[test]
-    fn ping_records_preserve_task_identity_and_skip_invalid_values() {
-        let body = serde_json::json!({
-            "data": { "records": [
-                { "task_id": 7, "time": "2026-08-29T16:50:00Z", "value": 42.5 },
-                { "task_id": 9, "time": "2026-08-29T16:51:00Z", "value": 1 },
-                { "task_id": 7, "time": "2026-08-29T16:52:00Z" }
-            ] }
-        });
-        let points = parse_ping_records(&body);
-        assert_eq!(points.len(), 2);
-        assert_eq!(points[0].task_id, 7);
-        assert_eq!(points[0].v, 42.5);
-        assert_eq!(points[1].task_id, 9);
-        assert_eq!(points[1].v, 1.0);
-    }
-
-    #[test]
     fn release_versions_use_semver_ordering() {
-        assert_eq!(parse_release_version("v1.2.3").unwrap(), semver::Version::new(1, 2, 3));
+        assert_eq!(
+            parse_release_version("v1.2.3").unwrap(),
+            semver::Version::new(1, 2, 3)
+        );
         assert!(parse_release_version("V2.0.0").unwrap() > semver::Version::new(1, 99, 99));
         assert!(
             parse_release_version("v1.2.3").unwrap()
