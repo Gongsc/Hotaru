@@ -4,7 +4,8 @@ use parking_lot::{Mutex, RwLock};
 use tauri::AppHandle;
 use tokio::sync::watch;
 
-use crate::models::{MonitorSnapshot, NetFrame, Settings};
+use crate::models::{MonitorSnapshot, NetFrame, PingData, Settings};
+use crate::providers::Provider;
 
 /// How long network history is kept in memory. Independent of the
 /// configured display range so switching ranges never has to re-accumulate.
@@ -78,9 +79,13 @@ pub struct AppState {
     pub panel_epoch: std::sync::atomic::AtomicU64,
     /// Aggregate network samples; lives only for the current process run.
     pub net_history: NetHistory,
-    /// Ping records per node uuid, refreshed by the monitor's ping loop so the
+    /// Ping records per node uuid, refreshed by the engine's ping loop so the
     /// popover gets latency and loss from memory like every other figure.
-    pub ping_records: RwLock<std::collections::BTreeMap<String, Vec<crate::models::PingPoint>>>,
+    pub ping_records: RwLock<std::collections::BTreeMap<String, PingData>>,
+    /// Which backend the engine last identified at `backend_url`. `None` until
+    /// it has connected once, which is also what the ping loop waits on: it
+    /// cannot know which endpoint to ask before then.
+    pub provider: RwLock<Option<Provider>>,
 }
 
 impl AppState {
@@ -110,6 +115,7 @@ pub fn init(app: &AppHandle) -> AppState {
         panel_epoch: std::sync::atomic::AtomicU64::new(1),
         net_history: NetHistory::default(),
         ping_records: RwLock::new(std::collections::BTreeMap::new()),
+        provider: RwLock::new(None),
     }
 }
 
@@ -118,7 +124,10 @@ mod tests {
     use super::*;
 
     fn frame(t: u64, up: f64) -> NetFrame {
-        NetFrame { t, nodes: vec![("a".into(), up, up * 2.0, true)] }
+        NetFrame {
+            t,
+            nodes: vec![("a".into(), up, up * 2.0, true)],
+        }
     }
 
     #[test]

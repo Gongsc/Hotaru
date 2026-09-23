@@ -181,12 +181,21 @@
     <h2>连接</h2>
     <label class="field">
       <span>后端地址</span>
-      <input type="text" id="backendUrl" placeholder="https://komari.example.com" spellcheck="false" autocomplete="off">
+      <input type="text" id="backendUrl" placeholder="https://probe.example.com" spellcheck="false" autocomplete="off">
     </label>
     <label class="field">
+      <span>后端类型</span>
+      <select id="backendKind" aria-label="后端类型">
+        <option value="auto">自动检测</option>
+        <option value="komari">Komari</option>
+        <option value="monitor">极简探针</option>
+      </select>
+    </label>
+    <label class="field" id="apiKeyRow">
       <span>API Key（私有站点或需要更全数据时填写）</span>
       <input type="password" id="apiKey" placeholder="可选" autocomplete="off">
     </label>
+    <p class="hint" id="probeHint" hidden>极简探针没有 API Key，只有管理员会话；登录态的接口还会带上每个节点的明文 token。因此这里只支持开启了公开页、可匿名访问的站点。</p>
     <div style="display:flex; gap:10px; align-items:flex-start;">
       <button class="btn" id="testBtn" type="button">测试连接</button>
       <label class="check" style="margin-top:4px;">
@@ -348,6 +357,7 @@ function collect() {
   return {
     ...currentSettings,
     backend_url: $('backendUrl').value.trim(),
+    backend_kind: $('backendKind').value,
     api_key: $('apiKey').value.trim(),
     poll_interval_secs: Math.max(1, Math.min(60, Number($('pollInterval').value) || 3)),
     show_menu_bar_text: $('showTitle').checked,
@@ -366,6 +376,9 @@ function collect() {
 function fillSettings(s, keepNodeList) {
   currentSettings = { ...s };
   $('backendUrl').value = s.backend_url || '';
+  $('backendKind').value = s.backend_kind || 'auto';
+  if ($('backendKind').selectedIndex === -1) $('backendKind').value = 'auto';
+  syncBackendKind();
   $('apiKey').value = s.api_key || '';
   $('pollInterval').value = s.poll_interval_secs ?? 3;
   $('cpuWarn').value = s.cpu_warn_pct ?? 80;
@@ -570,6 +583,16 @@ $('autostart').addEventListener('change', async (e) => {
 });
 
 $('theme').addEventListener('change', (e) => applyTheme(e.target.value));
+
+// 极简探针只支持匿名访问的公开站,API Key 在那边没有对应物,留着只会误导。
+// 「自动检测」下仍然显示:那条路会先按 Komari 试一次,私有 Komari 站需要它。
+function syncBackendKind() {
+  const isProbe = $('backendKind').value === 'monitor';
+  $('apiKeyRow').hidden = isProbe;
+  $('probeHint').hidden = !isProbe;
+}
+
+$('backendKind').addEventListener('change', syncBackendKind);
 
 async function openGithub(page) {
   try {

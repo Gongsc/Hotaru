@@ -2,7 +2,9 @@
 
 ## Project Structure & Module Organization
 
-Hotaru is a Tauri 2 tray application. Rust code lives in `src-tauri/src/`: `monitor.rs` handles Komari data, `tray.rs` renders tray state, `windows.rs` manages webviews, and `commands.rs` exposes Tauri commands. Keep shared models in `models.rs`, preferences in `settings.rs`, and runtime state in `state.rs`.
+Hotaru is a Tauri 2 tray application. Rust code lives in `src-tauri/src/`: `engine.rs` runs the monitoring loop, `tray.rs` renders tray state, `windows.rs` manages webviews, and `commands.rs` exposes Tauri commands. Keep shared models in `models.rs`, preferences in `settings.rs`, and runtime state in `state.rs`.
+
+Backend-specific code belongs in `src-tauri/src/providers/`, one module per backend (`komari.rs`, `monitor.rs` for 极简探针). A provider owns its wire format and its live session; everything a backend does not change — settings watching, reconnect backoff, error reporting, publishing, the ping cache — stays in `engine.rs`. Adding a backend should not require touching `engine.rs` beyond `providers::Provider`. Anything the popover renders must arrive as a `NodeSnapshot` field, so a difference in meaning between backends (traffic quotas being lifetime on one and monthly on the other, say) is resolved in the provider rather than in JavaScript.
 
 The build-free frontend is in `ui/` (`index.html` and `chart.html`). Capabilities and packaging configuration live in `src-tauri/capabilities/` and `src-tauri/tauri.conf.json`; icons are under `src-tauri/icons/`. `tools/mock-komari/` is a standalone mock server; `docs/` contains previews.
 
